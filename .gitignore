@@ -1,0 +1,17 @@
+# recordings, datasets, outputs
+data/
+output/
+*.mp4
+*.avi
+*.mkv
+# Julia
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+# editors / OS
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+Thumbs.db
+.DS_Store
