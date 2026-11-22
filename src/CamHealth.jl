@@ -14,15 +14,27 @@ using .TemporalFilters
 export TemporalFilters, BandSpec, PULSE, BREATHING, ButterBandpass, DiffLowpass,
        apply, init_state, step!, ideal_bandpass
 
-# Frame sources: (frame, timestamp) iterators
+# Frame sources: (frame, timestamp) iterators, frame-interval / brightness monitoring
 include("io/sources.jl")
-export AbstractFrameSource, CameraSource, FileSource
+export AbstractFrameSource, CameraSource, FileSource, FrameMonitor, lock_camera
 
-# Pipeline stages (stubs, filled in from M1 on)
+# Face detection and skin ROI
 include("face/face.jl")
+export Face, YuNetDetector, detect, FaceTracker, FixedROI, update!, face_roi, skin_mask, roi_rects
+
+# Signal extraction and rPPG methods
+include("signal/extract.jl")
 include("signal/rppg.jl")
+export RGBTrace, extract_trace, resample_uniform, rppg_green
+
+# Heart-rate estimation
 include("hr/estimate.jl")
+export HRTrack, estimate_hr, spectrum_peak, welch_psd
+
+# Pipelines / CLI
 include("magnify/evm.jl")
 include("app/app.jl")
+include("app/cli.jl")
+export analyze_clip
 
 end # module CamHealth

@@ -1,7 +1,9 @@
 using Test
 using CamHealth
 using CamHealth.TemporalFilters
-using DSP, FFTW, Random
+using DSP, FFTW, Random, Statistics
+using Colors, VideoIO
+using VideoIO: N0f8
 
 const FS = 30.0
 
@@ -107,5 +109,122 @@ end
         bpm = 60fpk
         @info "synthetic rPPG estimate" bpm
         @test abs(bpm - 72) < 1.0
+    end
+
+    # ------------------------------------------------------------------ M1
+    @testset "resample_uniform" begin
+        rng = MersenneTwister(3)
+        t = cumsum(fill(1 / 30, 300) .+ 0.004 .* randn(rng, 300)); t .-= t[1]
+        x = 2 .* t .+ 1                                   # linear -> interpolation is exact
+        valid = trues(300); valid[100:102] .= false       # short gap (dropped frames)
+        valid[200:240] .= false                           # long gap (face lost ~1.4 s)
+        tu, xu, vu = resample_uniform(t, x, 30.0; valid=valid)
+        @test step(range(tu[1], tu[end]; length=length(tu))) ≈ 1 / 30 atol = 1e-9
+        @test xu ≈ 2 .* tu .+ 1 atol = 1e-9
+        τ(a) = findmin(abs.(tu .- a))[2]
+        @test vu[τ(t[101])]                               # short gap bridged
+        @test !vu[τ(t[220])]                              # long gap stays invalid
+        @test count(vu) < length(vu)
+        X = hcat(x, -x)
+        _, Xu, _ = resample_uniform(t, X, 30.0)
+        @test Xu[:, 2] ≈ -Xu[:, 1]
+    end
+
+    @testset "Welch spectrum peak + SNR" begin
+        fs = 30.0; t = (0:299) ./ fs
+        f, P = welch_psd(sin.(2π * 1.37 .* t), fs; seglen=240)
+        f0, _ = spectrum_peak(f, P, PULSE)
+        @test abs(f0 - 1.37) < 0.01
+        @test CamHealth.snr_db(f, P, f0; tol=0.25) > 10
+        fn, Pn = welch_psd(randn(MersenneTwister(4), 300), fs; seglen=240)
+        g0, _ = spectrum_peak(fn, Pn, PULSE)
+        @test CamHealth.snr_db(fn, Pn, g0; tol=0.25) < 0
+        # HR track on a clean 84 bpm pulse with drift
+        x = 0.01 .* sin.(2π * 1.4 .* (0:899) ./ fs) .+ 0.05 .* (0:899) ./ 900
+        hr = estimate_hr(x, fs)
+        @test length(hr.t) == 21
+        @test all(abs.(hr.bpm .- 84) .< 1)
+    end
+
+    @testset "frame monitor: drops" begin
+        m = CamHealth.FrameMonitor(nominal_fps=30, warn=false)
+        fr = fill(RGB{N0f8}(0.5, 0.5, 0.5), 8, 8)
+        ts = [(0:9) ./ 30; (12:20) ./ 30]                 # frames 10, 11 missing
+        for t in ts; CamHealth.record!(m, fr, t); end
+        @test m.ndrop_events == 1
+        @test m.ndropped == 2
+    end
+
+    @testset "skin mask + YuNet decoding" begin
+        img = [RGB{N0f8}(0.8, 0.6, 0.5) RGB{N0f8}(0.1, 0.2, 0.9)]
+        @test skin_mask(img) == BitMatrix([1 0])
+        # one anchor of stride 32 at grid (r=2, c=3) with known box/landmarks
+        S = 640; out = Dict{String,Array{Float32,3}}()
+        for s in (8, 16, 32)
+            n = (S ÷ s)^2
+            out["cls_$s"] = zeros(Float32, 1, n, 1); out["obj_$s"] = zeros(Float32, 1, n, 1)
+            out["bbox_$s"] = zeros(Float32, 1, n, 4); out["kps_$s"] = zeros(Float32, 1, n, 10)
+        end
+        k = 2 * 20 + 3 + 1
+        out["cls_32"][1, k, 1] = 0.95; out["obj_32"][1, k, 1] = 0.95
+        out["bbox_32"][1, k, :] = [0.5, 0.5, log(2), log(3)]
+        out["kps_32"][1, k, :] = Float32[0, 0, 1, 0, 0.5, 0.5, 0, 1, 1, 1]
+        faces = CamHealth.yunet_decode(out, S, 0.8)
+        @test length(faces) == 1
+        f = faces[1]
+        @test f.score ≈ 0.95 atol = 1e-5
+        @test collect(f.box) ≈ [3.5 * 32 - 32, 2.5 * 32 - 48, 64, 96] atol = 1e-3
+        @test f.landmarks[:, 2] ≈ [4 * 32, 2 * 32]
+        @test length(CamHealth.nms([f, f], 0.3)) == 1
+        @test length(roi_rects(f)) == 3
+        model = CamHealth.default_model_path()
+        if isfile(model)
+            @test isempty(detect(YuNetDetector(model), fill(RGB{N0f8}(0.5, 0.5, 0.5), 480, 640)))
+        else
+            @info "YuNet model not downloaded; skipping detector run" model
+        end
+    end
+
+    # synthetic "video": noise everywhere, a 1.2 Hz green modulation inside a known square
+    function synthetic_frames(; n=450, fs=30.0, hz=1.2, amp=0.01, sz=(48, 64), roi=(15:30, 21:40), seed=5)
+        rng = MersenneTwister(seed)
+        frames = Matrix{RGB{N0f8}}[]; ts = Float64[]
+        for k in 0:n-1
+            t = k / fs
+            base = 0.45 .+ 0.02 .* randn(rng, sz...)
+            g = copy(base)
+            g[roi...] .+= amp * sin(2π * hz * t) + 0.002 * t        # pulse + slow drift
+            push!(frames, RGB{N0f8}.(clamp.(base .+ 0.15, 0, 1), clamp.(g, 0, 1), clamp.(base .- 0.05, 0, 1)))
+            push!(ts, t)
+        end
+        frames, ts
+    end
+
+    @testset "ROI mean -> green rPPG -> 72 bpm (in memory)" begin
+        frames, ts = synthetic_frames()
+        roi = FixedROI(20, 14, 20, 16)                    # x=col 21:40, y=row 15:30
+        @test count(update!(roi, frames[1])) == 20 * 16
+        tr = extract_trace(zip(frames, ts), roi)
+        @test length(tr) == 450 && all(tr.valid)
+        tu, X, vu = resample_uniform(tr, 30.0)
+        hr = estimate_hr(CamHealth.rppg_green(X; valid=vu), 30.0)
+        @test abs(median(hr.bpm) - 72) < 1
+        # a ROI outside the pulsing square finds no consistent pulse
+        tr2 = extract_trace(zip(frames, ts), FixedROI(0, 34, 15, 12))
+        hr2 = estimate_hr(CamHealth.rppg_green(resample_uniform(tr2, 30.0)[2]), 30.0)
+        @test median(hr2.snr) < median(hr.snr) - 10
+    end
+
+    @testset "end to end through FileSource (FFV1 video)" begin
+        frames, _ = synthetic_frames(n=450)
+        path = joinpath(mktempdir(), "synthetic.mkv")
+        VideoIO.save(path, frames; framerate=30, codec_name="ffv1", target_pix_fmt=VideoIO.AV_PIX_FMT_BGR0)
+        hr, tr, mon = analyze_clip(path; roi=FixedROI(20, 14, 20, 16), verbose=false,
+                                   csv=joinpath(dirname(path), "hr.csv"))
+        @test length(tr) == 450
+        @test mon.ndropped == 0
+        @test abs(median(hr.bpm) - 72) < 1
+        @test isfile(joinpath(dirname(path), "hr.csv"))
+        @test countlines(joinpath(dirname(path), "hr.csv")) == length(hr.t) + 1
     end
 end
