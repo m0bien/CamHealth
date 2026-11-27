@@ -45,9 +45,9 @@ function beat_metrics(est::Beats, ref::Beats; tol::Real=0.15)
             rmssd_est=he.rmssd_ms, rmssd_ref=hr_.rmssd_ms, rmssd_err_ms=abs(he.rmssd_ms - hr_.rmssd_ms))
 end
 
-"""Cached ROI trace for a sample (`results/cache/<dataset>_<name>.csv`)."""
-function sample_trace(s::BenchSample, cachedir::AbstractString; roi=:yunet, verbose=true)
-    f = joinpath(cachedir, "$(s.dataset)_$(s.name).csv")
+"""Cached ROI trace for a sample (`results/cache/<tag>_<name>.csv`; tag = benchmark run name)."""
+function sample_trace(s::BenchSample, cachedir::AbstractString; roi=:yunet, verbose=true, tag=s.dataset)
+    f = joinpath(cachedir, "$(tag)_$(s.name).csv")
     if isfile(f)
         d = readdlm(f, ',', Float64; skipstart=1)
         return RGBTrace(d[:, 1], d[:, 2:4], BitVector(d[:, 5] .> 0), round.(Int, d[:, 6]))
@@ -92,7 +92,7 @@ function run_benchmark(samples::Vector{BenchSample}; methods=RPPG_METHODS, roi=:
     rows = NamedTuple[]
     pooled = Dict(m => (est=Float64[], ref=Float64[], est_all=Float64[], ref_all=Float64[]) for m in methods)
     for s in samples
-        tr = sample_trace(s, joinpath(outdir, "cache"); roi=roi, verbose=verbose)
+        tr = sample_trace(s, joinpath(outdir, "cache"); roi=roi, verbose=verbose, tag=tag)
         count(tr.valid) < 2 && (verbose && println("  $(s.name): no face, skipped"); continue)
         for m in methods
             res = analyze_trace(tr; method=m, fs=fs, snr_min=snr_min, hrv=true)
