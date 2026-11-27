@@ -2,7 +2,7 @@ using Test
 using CamHealth
 using CamHealth.TemporalFilters
 using DSP, FFTW, Random, Statistics
-using Colors, VideoIO
+using Colors, VideoIO, FileIO
 using VideoIO: N0f8
 
 const FS = 30.0
@@ -227,4 +227,179 @@ end
         @test isfile(joinpath(dirname(path), "hr.csv"))
         @test countlines(joinpath(dirname(path), "hr.csv")) == length(hr.t) + 1
     end
+    # ------------------------------------------------------------------ M2
+    # skin RGB trace with a pulse along the blood-absorption direction, plus disturbances
+    function rgb_trace(; fs=30.0, T=30.0, hr=72.0, amp=0.003, flicker=0.0, specular=0.0, fdist=1.7, seed=11)
+        rng = MersenneTwister(seed)
+        t = collect(0:1/fs:T-1/fs)
+        p = sin.(2π * hr / 60 .* t)
+        skin = [0.70, 0.50, 0.40]; dir = [0.33, 0.77, 0.53]
+        I = 1 .+ flicker .* sin.(2π * fdist .* t)                 # common-mode brightness
+        sp = specular .* (1 .+ sin.(2π * fdist .* t .+ 1))        # white specular light
+        X = hcat([I .* (skin[c] .* (1 .- amp * dir[c] .* p) .+ sp) .+ 0.0005 .* randn(rng, length(t)) for c in 1:3]...)
+        return t, X, p
+    end
+
+    @testset "CHROM / POS vs green under brightness change and specular light" begin
+        fs = 30.0
+        # clean: all three methods find 72 bpm
+        _, X, _ = rgb_trace()
+        for m in RPPG_METHODS
+            @test abs(median_bpm(estimate_hr(rppg(X, m; fs=fs), fs)) - 72) < 1
+        end
+        # large in-band common-mode brightness change (5x the pulse) + specular term
+        _, X, p = rgb_trace(flicker=0.01, specular=0.01)
+        g = estimate_hr(rppg(X, :green; fs=fs), fs; snr_min=-Inf)
+        @test abs(median(g.bpm) - 72) > 10                         # green locks on the disturbance
+        for m in (:chrom, :pos)
+            hr = estimate_hr(rppg(X, m; fs=fs), fs)
+            @test abs(median_bpm(hr) - 72) < 1
+            @test count(hr.ok) >= 0.8 * length(hr.ok)
+        end
+        # sign convention: output is PPG-like (positively correlated with blood volume)
+        _, X, p = rgb_trace()
+        for m in RPPG_METHODS
+            y = filter_pulse(rppg(X, m; fs=fs), fs)
+            @test cor(y[60:end-60], p[60:end-60]) > 0.8
+        end
+        @test_throws ErrorException rppg(X, :ica)
+        # invalid samples are skipped, not propagated
+        v = trues(size(X, 1)); v[400:430] .= false
+        @test all(isfinite, rppg_pos(X, fs; valid=v)) && all(isfinite, rppg_chrom(X, fs; valid=v))
+    end
+
+    @testset "SNR quality gate + jump limit" begin
+        fs = 30.0
+        rng = MersenneTwister(12)
+        t = (0:1/fs:40-1/fs)
+        x = 0.01 .* sin.(2π * 1.2 .* t)
+        x[round(Int, 15fs):round(Int, 27fs)] .= 0                      # 12 s without pulse ...
+        x .+= 0.004 .* randn(rng, length(t))                            # ... only noise there
+        hr = estimate_hr(x, fs; snr_min=-3)
+        bad = findall(.!hr.ok)
+        @test !isempty(bad)
+        @test all(15 .<= hr.t[bad] .<= 28)                               # rejected = the noise span
+        @test abs(median_bpm(hr) - 72) < 1
+        @test all(abs.(hr.bpm[hr.ok] .- 72) .< 3)        # edge windows half-overlap the noise
+        @test count(estimate_hr(x, fs; snr_min=-Inf, max_jump=Inf).ok) == length(hr.t)
+        # jump limit: 72 -> 108 bpm switch; the first jumped windows are rejected, then re-lock
+        y = vcat(sin.(2π * 1.2 .* (0:1/fs:20-1/fs)), sin.(2π * 1.8 .* (0:1/fs:20-1/fs)))
+        hj = estimate_hr(y, fs; max_jump=2)
+        k = findfirst(>(90), hj.bpm)
+        @test k !== nothing && !hj.ok[k]
+        @test hj.ok[end] && abs(hj.bpm[end] - 108) < 1
+        # CSV marks low quality
+        f = tempname() * ".csv"
+        CamHealth.write_hr_csv(f, hr)
+        L = readlines(f)
+        @test L[1] == "time_s,bpm,snr_db,valid_frac,quality"
+        @test any(endswith(",low quality"), L) && any(endswith(",ok"), L)
+    end
+
+    @testset "beat detection: sub-frame accuracy" begin
+        fs = 30.0; T = 60.0
+        t = collect(0:1/fs:T-1/fs)
+        ppg, beats = CamHealth.synthetic_ppg(t; hr_bpm=70, hrv_ms=50, seed=3)
+        b = detect_beats(filter_pulse(ppg, fs), fs; hr=estimate_hr(ppg, fs))
+        inner = filter(x -> 2 < x < T - 2, beats)
+        pk = [b.peaks[argmin(abs.(b.peaks .- x))] for x in inner]
+        @test all(abs.(pk .- inner) .< 0.05)                             # every true beat found
+        @test length(b.peaks) <= length(filter(x -> 0 < x < T, beats)) + 1   # no spurious beats
+        @test mean(abs.(diff(pk) .- diff(inner))) < 0.005                # IBI error < 5 ms at 30 fps
+        @test count(b.ibi_ok) >= 0.9 * length(b.ibi)
+        k = findall(isfinite, b.feet)
+        @test length(k) >= 0.9 * length(b.feet)
+        @test all(b.feet[k] .< b.peaks[k])                               # foot precedes peak
+        # unfiltered waveform: peak times themselves are sub-frame accurate
+        b0 = detect_beats(ppg .- mean(ppg), fs)
+        pk0 = [b0.peaks[argmin(abs.(b0.peaks .- x))] for x in inner]
+        @test mean(abs.(pk0 .- inner)) < 0.005
+    end
+
+    @testset "HRV metrics on a known IBI series" begin
+        ibi = [800.0, 850, 780, 900, 820, 760]
+        h = hrv_metrics(ibi)
+        d = diff(ibi)
+        @test h.rmssd_ms ≈ sqrt(mean(d .^ 2))
+        @test h.sdnn_ms ≈ std(ibi)
+        @test h.pnn50 ≈ count(abs.(d) .> 50) / length(d)
+        @test h.mean_hr ≈ 60_000 / mean(ibi)
+        # rejected IBIs are skipped, and differences across them are not counted
+        b = CamHealth.Beats(Float64[], Float64[], ibi ./ 1000, Float64[], BitVector([1, 1, 0, 1, 1, 1]))
+        h2 = hrv_metrics(b)
+        @test h2.n_ibi == 5
+        d2 = [ibi[2] - ibi[1], ibi[5] - ibi[4], ibi[6] - ibi[5]]
+        @test h2.rmssd_ms ≈ sqrt(mean(d2 .^ 2))
+        # IBI cleaning: a missed beat (double IBI) is dropped by the local-median rule
+        fs = 30.0; t = collect(0:1/fs:30-1/fs)
+        ppg, beats = CamHealth.synthetic_ppg(t; hr_bpm=60, hrv_ms=10, seed=4)
+        k = findfirst(>(15), beats)
+        ppg .-= exp.(-((t .- beats[k]) ./ 0.09) .^ 2 ./ 2) .+ 0.35 .* exp.(-((t .- beats[k] .- 0.3) ./ 0.08) .^ 2 ./ 2)
+        bm = detect_beats(ppg .- mean(ppg), fs)          # unfiltered: a band-pass would "ring" a fake beat into the gap
+        long = findall(bm.ibi .> 1.5)
+        @test !isempty(long) && !any(bm.ibi_ok[long])
+    end
+
+    @testset "dataset loaders on fake fixtures" begin
+        dir = mktempdir()
+        # UBFC-rPPG dataset 2: ground_truth.txt layout (row1 PPG, row2 HR, row3 time)
+        roi = write_fake_ubfc(joinpath(dir, "ubfc"); n=2, seconds=12, sz=(32, 48), roi=(9:24, 13:36), hr=[72.0, 90.0])
+        s = load_ubfc2(joinpath(dir, "ubfc"))
+        @test [x.name for x in s] == ["subject1", "subject2"]
+        @test length(s[1].ppg) == 360 && s[1].ppg_t[1] == 0
+        @test s[1].ppg_t[end] ≈ 12 - 1 / 30 atol = 1e-4
+        src = s[1].open_frames(); n = 0
+        for _ in src; n += 1; end
+        close(src)
+        @test n == 360
+        _, _, hrrow = CamHealth.read_ubfc2_gt(joinpath(dir, "ubfc", "subject2", "ground_truth.txt"))
+        @test all(hrrow .== 90)
+        # benchmark harness end to end on the fixture
+        rows, summ = run_benchmark(s; methods=(:pos,), roi=roi, outdir=joinpath(dir, "res"), tag="fake", verbose=false)
+        @test length(rows) == 2
+        @test summ[1].pooled.mae < 2
+        @test isfile(joinpath(dir, "res", "benchmark_fake.csv"))
+        @test occursin("## fake", read(joinpath(dir, "res", "README.md"), String))
+        # PURE: PNG frames named by ns timestamp + json with /FullPackage and /Image
+        pd = joinpath(dir, "pure", "01-01"); mkpath(pd)
+        t0 = 1_000_000_000_000
+        ts = [t0 + round(Int, k * 1e9 / 30) for k in 0:9]
+        for tt in ts
+            save(joinpath(pd, "Image$(tt).png"), fill(RGB{N0f8}(0.6, 0.5, 0.4), 8, 8))
+        end
+        pk = [Dict("Timestamp" => t0 + round(Int, k * 1e9 / 60),
+                   "Value" => Dict("waveform" => 50 + k % 7, "pulseRate" => 70, "o2saturation" => 98, "signalStrength" => 4)) for k in 0:19]
+        open(joinpath(dir, "pure", "01-01.json"), "w") do io
+            CamHealth.JSON.print(io, Dict("/FullPackage" => pk, "/Image" => [Dict("Timestamp" => x) for x in ts]))
+        end
+        p = load_pure(joinpath(dir, "pure"))
+        @test length(p) == 1 && p[1].name == "01-01"
+        @test length(p[1].ppg) == 20
+        @test p[1].ppg_t[2] ≈ 1 / 60 atol = 1e-6
+        fr = collect(p[1].open_frames())
+        @test length(fr) == 10 && size(fr[1][1]) == (8, 8)
+        @test fr[2][2] ≈ 1 / 30 atol = 1e-6
+        # metrics
+        m = hr_metrics([70.0, 72, NaN, 80], [71.0, 72, 75, 70])
+        @test m.n == 3 && m.mae ≈ 11 / 3 && m.within5 ≈ 2 / 3
+    end
+
+    @testset "CLI with --method all and --hrv" begin
+        frames, _ = synthetic_frames(n=450)
+        dir = mktempdir(); path = joinpath(dir, "clip.mkv")
+        VideoIO.save(path, frames; framerate=30, codec_name="ffv1", target_pix_fmt=VideoIO.AV_PIX_FMT_BGR0)
+        out = tempname()
+        rc = open(out, "w") do io
+            redirect_stdout(io) do
+                CamHealth.cli_main([path, "--method", "all", "--roi", "20,14,20,16", "--hrv", "--csv", joinpath(dir, "hr.csv")])
+            end
+        end
+        @test rc == 0
+        for m in RPPG_METHODS
+            @test isfile(joinpath(dir, "hr_$(m).csv")) && isfile(joinpath(dir, "clip_beats_$(m).csv"))
+        end
+        txt = read(out, String)
+        @test occursin("[pos]", txt) && occursin("RMSSD", txt)
+    end
+
 end

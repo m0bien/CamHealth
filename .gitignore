@@ -15,3 +15,6 @@ output/
 !.vscode/extensions.json
 Thumbs.db
 .DS_Store
+
+# benchmark caches (derived from datasets that may not be redistributed)
+results/cache/
