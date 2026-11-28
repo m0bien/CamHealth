@@ -28,11 +28,18 @@ grep -v '^#' "$here/ubfc2_manifest.txt" | while read -r subj gt vid; do
       exit 3
     fi
     if [ "$sizes_only" = 1 ]; then echo "$subj/$name $rs"; continue; fi
+    # never resume a video that does not start like an AVI (an earlier error page would stay glued in front)
+    if [ "$name" = vid.avi ] && [ -f "$out" ] && [ "$(head -c 4 "$out")" != RIFF ]; then
+      echo "bad   $subj/$name: not an AVI, starting over"; rm -f "$out"
+    fi
     ls_=$(lsize "$out")
     if [ "$rs" -gt 0 ] && [ "$ls_" = "$rs" ]; then echo "ok    $subj/$name ($rs)"; continue; fi
     mkdir -p "$dest/$subj"
     curl -sSL --retry 5 --retry-delay 5 -C - -o "$out" "$(url "$id")"
     ls_=$(lsize "$out")
+    if [ "$name" = vid.avi ] && [ -f "$out" ] && [ "$(head -c 4 "$out")" != RIFF ]; then
+      rm -f "$out"; echo "QUOTA $subj/$name - got an error page, removed"; exit 3
+    fi
     if [ "$ls_" = "$rs" ]; then
       echo "done  $subj/$name ($rs)"
     else
