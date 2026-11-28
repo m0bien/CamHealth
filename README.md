@@ -5,8 +5,9 @@ tiny colour changes blood flow causes in facial skin, plus optional MIT Eulerian
 Magnification (EVM) to make the pulse visible. Works live from a webcam (Logitech C930e)
 or offline from a video file. See [PLAN.md](PLAN.md) for the full roadmap.
 
-**Status: M1 (offline baseline)** — lossless recording with locked camera settings,
-YuNet face detection + landmark ROI, green-channel rPPG, Welch heart-rate estimate, CLI.
+**Status: M2 (accurate rPPG + HRV)** — POS (default), CHROM and green methods, SNR quality
+gate, beat detection and HRV (RMSSD, SDNN, pNN50), benchmark harness for UBFC-rPPG / PURE.
+M1 delivered lossless recording with locked camera settings, YuNet face ROI and the CLI.
 
 ## Layout
 ```
@@ -18,16 +19,20 @@ src/filters/TemporalFilters.jl   standalone: BandSpec, PULSE, BREATHING, Butterw
 src/face/face.jl                 YuNet (ONNX Runtime) detection, forehead + cheek ROI ∩ skin mask,
                                  FaceTracker (detect every 10 frames, EMA smoothing), FixedROI fallback
 src/signal/extract.jl            ROI mean RGB per frame, resampling to a uniform grid, lost-face marking
-src/signal/rppg.jl               green method (CHROM / POS in M2)
-src/hr/estimate.jl               detrend, band-pass, Welch 10 s windows / 1 s hop, peak + SNR
+src/signal/rppg.jl               green, CHROM (de Haan 2013), POS (Wang 2017); PPG-like sign
+src/hr/estimate.jl               detrend, band-pass, Welch 10 s windows / 1 s hop, peak + SNR,
+                                 quality gate (SNR >= -3 dB, jumps <= 15 bpm/s)
+src/hr/beats.jl                  beats (250 Hz spline, peak + foot), IBI cleaning, RMSSD/SDNN/pNN50
+src/bench/                       UBFC-rPPG / PURE loaders, synthetic dataset, metrics, run_benchmark
 src/app/cli.jl                   analyze_clip, command line
-scripts/campulse.jl              offline heart rate from a clip
+scripts/campulse.jl              offline heart rate (and HRV) from a clip
+scripts/benchmark.jl             rPPG vs contact PPG: MAE, RMSE, r, Bland-Altman, IBI / RMSSD error
 scripts/record_clip.jl           record a lossless clip (FFV1) + per-frame timestamps
 scripts/camera_lock.ps1          lock / unlock exposure, white balance, focus
 scripts/download_models.jl       fetch the YuNet model into data/models/
 scripts/camera_check.jl          grab 150 frames, report size / fps / pixel format
 scripts/list_camera_modes.jl     list DirectShow devices and the camera's modes
-test/runtests.jl                 filters, resampling, ROI extraction, Welch estimator, end to end
+test/runtests.jl                 filters, ROI, methods under disturbances, gate, beats, HRV, loaders
 ```
 
 ## Setup and tests
@@ -40,11 +45,26 @@ julia --project scripts/download_models.jl          # YuNet face model (data/mod
 ## Measure heart rate from a clip
 ```
 julia --project scripts/record_clip.jl 30 data/me.mkv
-julia --project scripts/campulse.jl data/me.mkv --method green --csv data/me_hr.csv
+julia --project scripts/campulse.jl data/me.mkv                       # POS, quality-gated
+julia --project scripts/campulse.jl data/me.mkv --method all --hrv --csv data/me_hr.csv
 julia --project scripts/campulse.jl data/me.mkv --roi 260,120,120,80   # fixed ROI, no face detector
 ```
 Sit still, face the camera in steady light, about 50–80 cm away. `campulse` prints the
-median bpm and SNR; the CSV has one row per second (`time_s,bpm,snr_db,valid_frac`).
+median bpm and SNR over windows that pass the quality gate; the CSV has one row per second
+(`time_s,bpm,snr_db,valid_frac,quality`, bpm left empty for "low quality" windows). `--hrv`
+writes `data/<clip>_beats.csv` (peak and foot times, IBIs) and prints SDNN / RMSSD / pNN50.
+HRV needs a clean signal: at SNR around 0 dB the beat timing jitter dominates RMSSD.
+
+## Benchmark
+```
+julia --project scripts/benchmark.jl synthetic                 # harness check on generated clips
+julia --project scripts/benchmark.jl ubfc2 data/datasets/ubfc2   # UBFC-rPPG dataset 2
+julia --project scripts/benchmark.jl pure  data/datasets/pure    # PURE
+```
+Results: `results/benchmark_<dataset>.csv` and `results/README.md`. The datasets are not
+redistributable and stay in `data/datasets/` (git-ignored). UBFC-rPPG: folder links on
+https://sites.google.com/view/ybenezeth/ubfcrppg (research use, cite Bobbia et al. 2017).
+PURE: request access from TU Ilmenau by email.
 
 ## Camera
 ```
